@@ -10,10 +10,7 @@ macro (add_executable _name)
   endif()
 endmacro()
 
-add_library(err err.c)
-add_library(in_cksum in_cksum.c)
-add_library(dropnobody dropnobody.c myping.c)
-
+add_executable(myping myping.c)
 add_executable(rawping rawping.c)
 add_executable(spoofping spoofping.c)
 
