@@ -1,16 +1,35 @@
 #ifndef _ERR_
 #define _ERR_
 
+#include "err.h"
 #include <errno.h>
+#include <pwd.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
 #include <string.h>
-#include "err.h"
-#include <pwd.h>
-#include <stdlib.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+
+#define PRINT_ERRNO()                                                  \
+    do {                                                               \
+        if (errno != 0) {                                              \
+            fprintf(stderr, "Error: errno %d in %s at %s:%d\n%s\n",    \
+              errno, __func__, __FILE__, __LINE__, strerror(errno));   \
+            exit(EXIT_FAILURE);                                        \
+        }                                                              \
+    } while (0)
+
+
+// Set `errno` to 0 and evaluate `x`. If `errno` changed, describe it and exit.
+#define CHECK_ERRNO(x)                                                             \
+    do {                                                                           \
+        errno = 0;                                                                 \
+        (void) (x);                                                                \
+        PRINT_ERRNO();                                                             \
+    } while (0)
 
 /* Wypisuje informację o błędnym zakończeniu funkcji systemowej
 i kończy działanie programu. */
@@ -86,6 +105,18 @@ void drop_to_nobody() {
   if (setuid(0) != -1)
     fatal("ERROR: Managed to regain root privileges?");
 
+}
+
+inline static void install_signal_handler(int signal, void (*handler)(int), int flags) {
+  struct sigaction action;
+  sigset_t block_mask;
+
+  sigemptyset(&block_mask);
+  action.sa_handler = handler;
+  action.sa_mask = block_mask;
+  action.sa_flags = flags;
+
+  CHECK_ERRNO(sigaction(signal, &action, NULL));
 }
 
 #endif

@@ -1,35 +1,53 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <unistd.h>
-
-// this sets ICMP declaration
-#include "common.h"
-#include <netinet/ip_icmp.h>
 #include <time.h>
+#include <unistd.h>
+// this sets ICMP declaration
+#include <netinet/ip_icmp.h>
+
+#include "common.h"
 
 #define BSIZE 1000
 #define ICMP_HEADER_LEN 8
 #define MAX_ID 1 << 1
 
-int icmp_seq_counter = 0;
+bool finish = false;
+uint16_t seq_num = 0;
 
-void send_ping_request(int sock, char *s_send_addr, struct timespec *start_time,
-                       struct icmp *icmp) {
+struct ping_info {
+  ssize_t len;             // git
+  struct sockaddr_in addr; // git
+  socklen_t addr_len;      // git
+  int ttl;
+  uint16_t seq;
+  struct timespec start; // git
+  struct timespec end;   // git
+};
+
+/* Obsługa sygnału kończenia */
+static void catch_int(int sig) {
+  finish = true;
+  fprintf(stderr, " Signal %d catched\n.", sig);
+}
+
+void send_ping_request(int sock, char *s_send_addr, struct ping_info *info) {
   struct addrinfo addr_hints;
   struct addrinfo *addr_result;
   struct sockaddr_in send_addr;
+  struct icmp *icmp;
 
   char send_buffer[BSIZE];
 
   int err = 0;
-  ssize_t data_len = 0;
-  ssize_t icmp_len = 0;
+  int data_len = 0;
+  int icmp_len = 0;
   ssize_t len = 0;
 
   // 'converting' host/port in string to struct addrinfo
@@ -54,7 +72,7 @@ void send_ping_request(int sock, char *s_send_addr, struct timespec *start_time,
   icmp->icmp_code = 0;
   icmp->icmp_id = htons(getpid() % MAX_ID); // process identified by PID
   // modulo MAX_ID in case pid is greater than 2^16
-  icmp->icmp_seq = htons(0); // sequential number
+  icmp->icmp_seq = htons((uint16_t)seq_num++); // sequential number
   data_len = snprintf(((char *)send_buffer + ICMP_HEADER_LEN),
                       sizeof(send_buffer) - ICMP_HEADER_LEN, "BASIC PING!");
   if (data_len < 1)
@@ -63,41 +81,62 @@ void send_ping_request(int sock, char *s_send_addr, struct timespec *start_time,
   icmp->icmp_cksum = 0; // checksum computed over whole ICMP package
   icmp->icmp_cksum = in_cksum((unsigned short *)icmp, icmp_len);
 
+  struct timeval tmp_tv;
+  gettimeofday(&tmp_tv, NULL);
+  memcpy(icmp + ICMP_HEADER_LEN, &tmp_tv, sizeof(tmp_tv));
+  icmp_len += sizeof(tmp_tv);
+
   len = sendto(sock, (void *)icmp, icmp_len, 0, (struct sockaddr *)&send_addr,
                (socklen_t)sizeof(send_addr));
-  if (clock_gettime(CLOCK_MONOTONIC, start_time) == -1)
+  struct timespec start;
+  if (clock_gettime(CLOCK_MONOTONIC, &start) == -1)
     syserr("clock_gettime");
+  info->start = start;
 
   if (icmp_len != (ssize_t)len)
     syserr("partial / failed write");
 }
 
-int receive_ping_reply(int sock, struct timespec *end,
-                       struct sockaddr_in *rcv_addr, socklen_t *rcv_addr_len,
-                       ssize_t *len, struct icmp *icmp, struct ip *ip) {
+int receive_ping_reply(int sock, struct ping_info *info) {
+  struct sockaddr_in rcv_addr;
+  socklen_t rcv_addr_len;
+
+  struct ip *ip;
+  struct icmp *icmp;
 
   char rcv_buffer[BSIZE];
 
   ssize_t ip_header_len = 0;
   ssize_t data_len = 0;
   ssize_t icmp_len = 0;
+  ssize_t len;
 
   memset(rcv_buffer, 0, sizeof(rcv_buffer));
-  *rcv_addr_len = (socklen_t)sizeof(*rcv_addr);
-  *len = recvfrom(sock, (void *)rcv_buffer, sizeof(rcv_buffer), 0,
-                  (struct sockaddr *)rcv_addr, rcv_addr_len);
-  if (clock_gettime(CLOCK_MONOTONIC, end) == -1)
+  rcv_addr_len = (socklen_t)sizeof(rcv_addr);
+  len = recvfrom(sock, rcv_buffer, sizeof(rcv_buffer), 0,
+                 (struct sockaddr *)&rcv_addr, &rcv_addr_len);
+  struct timespec end;
+  if (clock_gettime(CLOCK_MONOTONIC, &end) == -1)
     syserr("clock_gettime");
-
-  if (*len == -1)
+  if (len == -1)
     syserr("failed read");
+  info->end = end;
+  info->addr = rcv_addr;
+  info->addr_len = rcv_addr_len;
+  info->len = len;
 
+  struct timeval tmp_tv;
+  memset(&tmp_tv, 0, sizeof(tmp_tv));
+  memcpy(&tmp_tv, rcv_buffer + 39, sizeof(tmp_tv));
+//  printf("timeval: %ld.%06ld\n", tmp_tv.tv_sec, tmp_tv.tv_usec);
   // recvfrom returns whole packet (with IP header)
   ip = (struct ip *)rcv_buffer;
   ip_header_len = ip->ip_hl << 2; // IP header len is in 4-byte words
+  info->ttl = ip->ip_ttl;
 
   icmp = (struct icmp *)(rcv_buffer + ip_header_len); // ICMP header follows IP
-  icmp_len = *len - ip_header_len;
+  icmp_len = len - ip_header_len;
+  info->seq = icmp->icmp_seq;
 
   if (icmp_len < ICMP_HEADER_LEN)
     fatal("icmp header len (%d) < ICMP_HEADER_LEN", icmp_len);
@@ -111,19 +150,15 @@ int receive_ping_reply(int sock, struct timespec *end,
     fatal("reply with id %d different from my pid %d", ntohs(icmp->icmp_id),
           getpid());
 
-  //  data_len = *len - ip_header_len - ICMP_HEADER_LEN;
-  //  printf("correct ICMP echo reply; payload size: %zd content: %.*s\n",
-  //  data_len,
-  //         (int)data_len, (rcv_buffer + ip_header_len + ICMP_HEADER_LEN));
   return 1;
 }
 
-void print_info(ssize_t len, struct sockaddr_in rcv_addr, struct timespec start,
-                struct timespec end, struct icmp *icmp, struct ip *ip) {
-  printf("%zu bytes from %s: ", len, inet_ntoa(rcv_addr.sin_addr));
-  printf("icmp_seq=%d ttl=%d", ntohs(icmp->icmp_seq), ip->ip_ttl);
-  printf(" time=%f ms\n", (double)(end.tv_sec - start.tv_sec) * 1000 +
-                              (double)(end.tv_nsec - start.tv_nsec) / 1000000);
+void print_info(struct ping_info info) {
+  printf("%zu bytes from %s: ", info.len, inet_ntoa(info.addr.sin_addr));
+  printf("icmp_seq=%d ttl=%d", ntohs(info.seq), info.ttl);
+  printf(" time=%f ms\n",
+         (double)(info.end.tv_sec - info.start.tv_sec) * 1000 +
+             (double)(info.end.tv_nsec - info.start.tv_nsec) / 1000000);
 }
 
 int main(int argc, char *argv[]) {
@@ -133,31 +168,30 @@ int main(int argc, char *argv[]) {
     fatal("Usage: %s host\n", argv[0]);
   }
 
+  install_signal_handler(SIGINT, catch_int, SA_RESTART);
+
   sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
   if (sock < 0)
     syserr("socket");
 
   drop_to_nobody();
 
-  struct timespec start, end;
-  struct sockaddr_in rcv_addr;
-  socklen_t rcv_addr_len = 0;
-  ssize_t received = 0;
-  struct icmp icmp;
-  struct ip ip;
+  struct ping_info ping_info;
+  memset(&ping_info, 0, sizeof(ping_info));
 
-  while (1) {
-    send_ping_request(sock, argv[1], &start, &icmp);
+  while (!finish) {
+    send_ping_request(sock, argv[1], &ping_info);
 
-    while (!receive_ping_reply(sock, &end, &rcv_addr, &rcv_addr_len, &received,
-                               &icmp, &ip)) {
-      ;
+    while (!receive_ping_reply(sock, &ping_info)) {
     }
-    print_info(received, rcv_addr, start, end, &icmp, &ip);
+
+    print_info(ping_info);
+
     sleep(1);
   }
-  //todo read about icmp
-  //todo change icmp initialization and something with ip
+  // todo read about icmp
+  // todo change icmp initialization and something with ip
+  // todo add finish with SIGINT
 
   if (close(sock) == -1)
     syserr("close");
